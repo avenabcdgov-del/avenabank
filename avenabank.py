@@ -1,16 +1,25 @@
 """AvenaBank - fictional national bank of Avena. Currency: Aurum (₳). Not real money.
-SINGLE FILE. Setup:  pip install flask
+SINGLE FILE. Setup:  pip install flask "psycopg[binary]"
   1) python avenabank.py create-president      (prompts for the President's password)
   2) python avenabank.py                       (opens on http://127.0.0.1:5000)
-Hosting: set HOST=0.0.0.0, PORT, AVENABANK_HTTPS=1 and AVENABANK_DB=/persistent/path/avenabank.db
+Hosting with a free Postgres (e.g. Neon): set DATABASE_URL and SECRET_KEY (any long random text). Without DATABASE_URL it uses a local SQLite file.
+Other settings: HOST=0.0.0.0, PORT, AVENABANK_HTTPS=1 and AVENABANK_DB=/persistent/path/avenabank.db
 """
-import os, sys, sqlite3, secrets, json, getpass, html
+import os, re, sys, sqlite3, secrets, json, getpass, html
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 from functools import wraps
 from flask import Flask, g, request, session, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+PG = bool(DATABASE_URL)
+if PG:
+    import psycopg
+    INTEGRITY = (psycopg.errors.UniqueViolation,)
+else:
+    INTEGRITY = (sqlite3.IntegrityError,)
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB = os.environ.get("AVENABANK_DB", os.path.join(BASE, "instance", "avenabank.db"))
@@ -54,11 +63,41 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 INSERT OR IGNORE INTO settings VALUES('max_transfer','1000000'),('large_issue','1000000');
 """
 
+PG_SCHEMA = re.sub(r"CREATE TRIGGER[^\n]*\n", "", SCHEMA).replace("INTEGER PRIMARY KEY", "BIGSERIAL PRIMARY KEY").replace("INTEGER", "BIGINT")
+PG_SCHEMA = PG_SCHEMA.replace("INSERT OR IGNORE INTO settings VALUES('max_transfer','1000000'),('large_issue','1000000');", "INSERT INTO settings VALUES('max_transfer','1000000'),('large_issue','1000000') ON CONFLICT DO NOTHING;")
+PG_TRIG = """
+CREATE OR REPLACE FUNCTION avb_immutable() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'records are immutable'; END; $$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS ledger_imm ON ledger;
+CREATE TRIGGER ledger_imm BEFORE UPDATE OR DELETE ON ledger FOR EACH ROW EXECUTE FUNCTION avb_immutable();
+DROP TRIGGER IF EXISTS tx_imm ON transactions;
+CREATE TRIGGER tx_imm BEFORE DELETE ON transactions FOR EACH ROW EXECUTE FUNCTION avb_immutable();
+"""
+
+class Row(dict):
+    def __getitem__(self, k): return list(self.values())[k] if isinstance(k, int) else dict.__getitem__(self, k)
+class PGCur:
+    def __init__(self, cur):
+        self.rowcount, self.rows = cur.rowcount, []
+        if cur.description:
+            cols = [c.name for c in cur.description]
+            self.rows = [Row((k, int(v) if isinstance(v, Decimal) else v) for k, v in zip(cols, r)) for r in cur.fetchall()]
+        self.lastrowid = self.rows[0]["id"] if self.rows and "id" in self.rows[0] else None
+    def fetchone(self): return self.rows[0] if self.rows else None
+    def fetchall(self): return self.rows
+    def __iter__(self): return iter(self.rows)
+class PGConn:
+    def __init__(self): self.c = psycopg.connect(DATABASE_URL, autocommit=True)
+    def execute(self, sql, p=()):
+        sql = sql.replace("?", "%s").replace(" LIKE ", " ILIKE ").replace("BEGIN IMMEDIATE", "BEGIN")
+        if sql.lstrip().upper().startswith("INSERT INTO") and "INTO settings" not in sql and "RETURNING" not in sql: sql += " RETURNING id"
+        return PGCur(self.c.execute(sql, list(p) if p else None))
+    def close(self): self.c.close()
+
 app = Flask(__name__, static_folder=None)
 _kf = os.path.join(os.path.dirname(DB), "secret_key")
-if not os.path.exists(_kf):
+if not os.environ.get("SECRET_KEY") and not os.path.exists(_kf):
     open(_kf, "w").write(secrets.token_hex(32)); os.chmod(_kf, 0o600)
-app.secret_key = open(_kf).read().strip()
+app.secret_key = os.environ.get("SECRET_KEY") or open(_kf).read().strip()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict",
                   SESSION_COOKIE_SECURE=os.environ.get("AVENABANK_HTTPS") == "1")
 
@@ -73,6 +112,7 @@ def _any_err(e):
     app.logger.exception(e); return jsonify(error="Something went wrong. Nothing was changed."), 500
 
 def db():
+    if "db" not in g and PG: g.db = PGConn()
     if "db" not in g:
         g.db = sqlite3.connect(DB, isolation_level=None, timeout=15)
         g.db.row_factory = sqlite3.Row
@@ -84,11 +124,15 @@ def _close(_):
     if d: d.close()
 
 def init_db():
-    c = sqlite3.connect(DB); c.executescript(SCHEMA); c.close()
+    if PG:
+        c = psycopg.connect(DATABASE_URL, autocommit=True); c.execute(PG_SCHEMA); c.execute(PG_TRIG); c.close()
+    else:
+        c = sqlite3.connect(DB); c.executescript(SCHEMA); c.close()
 
 @contextmanager
 def txn():
     d = db(); d.execute("BEGIN IMMEDIATE")
+    if PG: d.execute("SELECT pg_advisory_xact_lock(7001)")  # one money-moving transaction at a time
     try: yield d; d.execute("COMMIT")
     except BaseException: d.execute("ROLLBACK"); raise
 
@@ -298,7 +342,7 @@ def adm_create_account():
     with txn():
         try: uid = db().execute("INSERT INTO users(username,pw_hash,role,preferred_name,citizen_id,created_at) VALUES(?,?,'citizen',?,?,?)",
                 (un, generate_password_hash(pw), d["name"].strip()[:60], str(d.get("citizen_id") or "").strip() or None, now())).lastrowid
-        except sqlite3.IntegrityError: raise ApiError("That username or citizen ID is already in use.")
+        except INTEGRITY: raise ApiError("That username or citizen ID is already in use.")
         pub = "AVN-" + secrets.token_hex(5).upper()
         db().execute("INSERT INTO accounts(public_id,user_id,created_at) VALUES(?,?,?)", (pub, uid, now())); audit("account.create", pub, "new citizen account")
     return jsonify(public_id=pub)
@@ -450,9 +494,9 @@ def cli():
     if sys.argv[1:2] == ["create-president"]:
         un = input("President username: ").strip().lower(); pw = os.environ.get("AVENABANK_ADMIN_PASSWORD") or getpass.getpass("Password (10+ chars): ")
         if len(pw) < 10: sys.exit("Password too short.")
-        c = sqlite3.connect(DB); c.execute("PRAGMA foreign_keys=ON")
-        uid = c.execute("INSERT INTO users(username,pw_hash,role,preferred_name,created_at) VALUES(?,?,'president','President',?)", (un, generate_password_hash(pw), now())).lastrowid
-        c.execute("INSERT INTO accounts(public_id,user_id,created_at) VALUES(?,?,?)", ("AVN-" + secrets.token_hex(5).upper(), uid, now())); c.commit(); print("President created.")
+        with app.app_context():
+            c = db(); uid = c.execute("INSERT INTO users(username,pw_hash,role,preferred_name,created_at) VALUES(?,?,'president','President',?)", (un, generate_password_hash(pw), now())).lastrowid
+            c.execute("INSERT INTO accounts(public_id,user_id,created_at) VALUES(?,?,?)", ("AVN-" + secrets.token_hex(5).upper(), uid, now())); print("President created.")
     else:
         app.run(host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", 5000)))
 
