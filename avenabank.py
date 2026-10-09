@@ -3,6 +3,7 @@ SINGLE FILE. Setup:  pip install flask "psycopg[binary]"
   1) python avenabank.py create-president      (prompts for the President's password)
   2) python avenabank.py                       (opens on http://127.0.0.1:5000)
 Hosting with a free Postgres (e.g. Neon): set DATABASE_URL and SECRET_KEY (any long random text). Without DATABASE_URL it uses a local SQLite file.
+No shell on your host? Set AVENABANK_ADMIN_USER and AVENABANK_ADMIN_PASSWORD (10+ chars) once; the President is created on first start. Delete the password variable afterwards.
 Other settings: HOST=0.0.0.0, PORT, AVENABANK_HTTPS=1 and AVENABANK_DB=/persistent/path/avenabank.db
 """
 import os, re, sys, sqlite3, secrets, json, getpass, html
@@ -489,14 +490,25 @@ def adm_card(cid):
 @app.get("/")
 def index(): return PAGE
 
+def make_president(un, pw):
+    with app.app_context():
+        c = db(); uid = c.execute("INSERT INTO users(username,pw_hash,role,preferred_name,created_at) VALUES(?,?,'president','President',?)", (un, generate_password_hash(pw), now())).lastrowid
+        c.execute("INSERT INTO accounts(public_id,user_id,created_at) VALUES(?,?,?)", ("AVN-" + secrets.token_hex(5).upper(), uid, now()))
+
+def bootstrap_president():
+    """For hosts with no shell: if AVENABANK_ADMIN_USER/PASSWORD are set and no President exists yet, create one. Remove the password variable afterwards."""
+    un, pw = os.environ.get("AVENABANK_ADMIN_USER", "").strip().lower(), os.environ.get("AVENABANK_ADMIN_PASSWORD", "")
+    if not un or len(pw) < 10: return
+    with app.app_context():
+        if db().execute("SELECT 1 FROM users WHERE role='president'").fetchone(): return
+    make_president(un, pw)
+
 def cli():
-    init_db()
+    init_db(); bootstrap_president()
     if sys.argv[1:2] == ["create-president"]:
         un = input("President username: ").strip().lower(); pw = os.environ.get("AVENABANK_ADMIN_PASSWORD") or getpass.getpass("Password (10+ chars): ")
         if len(pw) < 10: sys.exit("Password too short.")
-        with app.app_context():
-            c = db(); uid = c.execute("INSERT INTO users(username,pw_hash,role,preferred_name,created_at) VALUES(?,?,'president','President',?)", (un, generate_password_hash(pw), now())).lastrowid
-            c.execute("INSERT INTO accounts(public_id,user_id,created_at) VALUES(?,?,?)", ("AVN-" + secrets.token_hex(5).upper(), uid, now())); print("President created.")
+        make_president(un, pw); print("President created.")
     else:
         app.run(host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", 5000)))
 
