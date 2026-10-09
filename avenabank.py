@@ -53,6 +53,12 @@ CREATE TABLE IF NOT EXISTS batch_items(id INTEGER PRIMARY KEY, batch_id INTEGER 
 CREATE TABLE IF NOT EXISTS cards(id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id),
   last4 TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Active' CHECK(status IN('Active','Frozen','Inactive','Replaced')),
   expiry TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS shops(id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT DEFAULT '', emoji TEXT DEFAULT '🛍️',
+  owner_account_id INTEGER NOT NULL REFERENCES accounts(id), active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY, shop_id INTEGER NOT NULL REFERENCES shops(id), name TEXT NOT NULL,
+  description TEXT DEFAULT '', emoji TEXT DEFAULT '🎁', price INTEGER NOT NULL CHECK(price>0), stock INTEGER, active INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY, tx_id INTEGER NOT NULL REFERENCES transactions(id),
+  product_id INTEGER NOT NULL REFERENCES products(id), qty INTEGER NOT NULL, card_id INTEGER REFERENCES cards(id), created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
   title TEXT NOT NULL, body TEXT NOT NULL, link TEXT, read INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS disputes(id INTEGER PRIMARY KEY, tx_id INTEGER NOT NULL REFERENCES transactions(id),
@@ -124,11 +130,18 @@ def _close(_):
     d = g.pop("db", None)
     if d: d.close()
 
+MIGRATE = ["ALTER TABLE cards ADD COLUMN number TEXT", "ALTER TABLE cards ADD COLUMN pin_hash TEXT", "ALTER TABLE cards ADD COLUMN pin_fails INTEGER NOT NULL DEFAULT 0"]
 def init_db():
     if PG:
-        c = psycopg.connect(DATABASE_URL, autocommit=True); c.execute(PG_SCHEMA); c.execute(PG_TRIG); c.close()
+        c = psycopg.connect(DATABASE_URL, autocommit=True); c.execute(PG_SCHEMA); c.execute(PG_TRIG)
+        for m in MIGRATE: c.execute(m.replace("ADD COLUMN", "ADD COLUMN IF NOT EXISTS").replace("INTEGER", "BIGINT"))
+        c.close()
     else:
-        c = sqlite3.connect(DB); c.executescript(SCHEMA); c.close()
+        c = sqlite3.connect(DB); c.executescript(SCHEMA)
+        for m in MIGRATE:
+            try: c.execute(m)
+            except sqlite3.OperationalError: pass  # column already there
+        c.commit(); c.close()
 
 @contextmanager
 def txn():
@@ -269,21 +282,40 @@ def notifs():
     u = me(); rows = [dict(r) for r in db().execute("SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 50", (u["id"],))]
     db().execute("UPDATE notifications SET read=1 WHERE user_id=?", (u["id"],)); return jsonify(rows)
 
+def new_number():
+    while True:
+        n = "".join(secrets.choice("0123456789") for _ in range(12))
+        if not db().execute("SELECT 1 FROM cards WHERE number=?", (n,)).fetchone(): return n
+def valid_pin(p):
+    p = str(p or "")
+    if not (len(p) == 4 and p.isdigit()): raise ApiError("PIN must be exactly 4 digits.")
+    return p
 @app.get("/api/cards")
 @login_required
 def cards():
     a = my_account(); u = me()
-    return jsonify([dict(c, holder=u["preferred_name"]) for c in db().execute("SELECT * FROM cards WHERE account_id=? ORDER BY id DESC", (a["id"],))])
+    for r in db().execute("SELECT id FROM cards WHERE account_id=? AND number IS NULL", (a["id"],)).fetchall():
+        n = new_number(); db().execute("UPDATE cards SET number=?, last4=? WHERE id=?", (n, n[-4:], r["id"]))
+    return jsonify([
+        {k: c[k] for k in ("id", "number", "last4", "status", "expiry")} | dict(holder=u["preferred_name"], has_pin=bool(c["pin_hash"])) for c in db().execute(
+        "SELECT id,number,last4,status,expiry,pin_hash FROM cards WHERE account_id=? ORDER BY id DESC", (a["id"],))])
 @app.post("/api/cards")
 @login_required
 def card_request():
-    a = my_account()
+    a = my_account(); pin = valid_pin(body().get("pin"))
     if a["status"] != "Active": raise ApiError("Account is restricted.", 403)
     with txn():
         if db().execute("SELECT 1 FROM cards WHERE account_id=? AND status IN('Active','Frozen')", (a["id"],)).fetchone(): raise ApiError("You already have a live card.")
-        yr = int(now()[:4]) + 4
-        db().execute("INSERT INTO cards(account_id,last4,expiry,created_at) VALUES(?,?,?,?)", (a["id"], f"{secrets.randbelow(10000):04d}", f"{now()[5:7]}/{yr}", now()))
+        yr = int(now()[:4]) + 4; n = new_number()
+        db().execute("INSERT INTO cards(account_id,last4,number,pin_hash,expiry,created_at) VALUES(?,?,?,?,?,?)", (a["id"], n[-4:], n, generate_password_hash(pin), f"{now()[5:7]}/{yr}", now()))
     return jsonify(ok=True)
+@app.post("/api/cards/<int:cid>/pin")
+@login_required
+def card_pin(cid):
+    a = my_account(); d = body(); c = db().execute("SELECT * FROM cards WHERE id=? AND account_id=?", (cid, a["id"])).fetchone()
+    if not c: raise ApiError("Card not found.", 404)
+    if c["pin_hash"] and not check_password_hash(c["pin_hash"], str(d.get("old", ""))): raise ApiError("Current PIN is wrong.", 403)
+    db().execute("UPDATE cards SET pin_hash=?, pin_fails=0 WHERE id=?", (generate_password_hash(valid_pin(d.get("pin"))), cid)); return jsonify(ok=True)
 @app.post("/api/cards/<int:cid>/<act>")
 @login_required
 def card_act(cid, act):
@@ -292,7 +324,7 @@ def card_act(cid, act):
     new = {"freeze": ("Active", "Frozen"), "unfreeze": ("Frozen", "Active")}.get(act)
     if not new or c["status"] != new[0]: raise ApiError("That card action is not available.")
     with txn():
-        db().execute("UPDATE cards SET status=? WHERE id=?", (new[1], cid)); notify(me()["id"], "Card status changed", f"Card ••{c['last4']} is now {new[1]}.")
+        db().execute("UPDATE cards SET status=?, pin_fails=0 WHERE id=?", (new[1], cid)); notify(me()["id"], "Card status changed", f"Card ••{c['last4']} is now {new[1]}.")
     return jsonify(ok=True)
 
 @app.post("/api/disputes")
@@ -301,6 +333,84 @@ def dispute():
     d = body(); a = my_account(); t = db().execute("SELECT id FROM transactions WHERE ref=? AND (sender_id=? OR recipient_id=?)", (d.get("ref"), a["id"], a["id"])).fetchone()
     if not t or not str(d.get("message", "")).strip(): raise ApiError("Choose one of your transactions and describe the problem.")
     db().execute("INSERT INTO disputes(tx_id,user_id,message,created_at) VALUES(?,?,?,?)", (t[0], me()["id"], str(d["message"])[:1000], now())); return jsonify(ok=True)
+
+# ---------- marketplace ----------
+def shop_manager(shop):
+    u = me()
+    if u["role"] == "president" or (u["role"] == "official" and "shops" in json.loads(u["perms"])): return True
+    return acct_user(shop["owner_account_id"]) == u["id"]
+@app.get("/api/shops")
+@login_required
+def shops():
+    mine = db().execute("SELECT id FROM accounts WHERE user_id=?", (me()["id"],)).fetchone()
+    out = []
+    for r in db().execute("SELECT s.id,s.name,s.description,s.emoji,s.owner_account_id,u.preferred_name AS owner FROM shops s JOIN accounts a ON a.id=s.owner_account_id JOIN users u ON u.id=a.user_id WHERE s.active=1 ORDER BY s.id").fetchall():
+        d = dict(r); d["mine"] = bool(mine and mine["id"] == r["owner_account_id"])
+        d["products"] = [dict(p, price_fmt=fmt(p["price"])) for p in db().execute("SELECT id,name,description,emoji,price,stock FROM products WHERE shop_id=? AND active=1 ORDER BY id", (r["id"],))]
+        out.append(d)
+    return jsonify(out)
+@app.post("/api/admin/shops")
+@need("shops")
+def shop_create():
+    d = body(); name = str(d.get("name", "")).strip()[:60]
+    if not name: raise ApiError("A shop name is required.")
+    with txn():
+        o = db().execute("SELECT id FROM accounts WHERE public_id=? AND status='Active'", (str(d.get("owner", "")).strip().upper(),)).fetchone()
+        if not o: raise ApiError("Shop owner must be an active account ID.")
+        db().execute("INSERT INTO shops(name,description,emoji,owner_account_id,created_at) VALUES(?,?,?,?,?)", (name, str(d.get("description", ""))[:200], str(d.get("emoji") or "🛍️")[:8], o["id"], now()))
+        audit("shop.create", name, "new shop")
+    return jsonify(ok=True)
+@app.post("/api/shops/<int:sid>/products")
+@login_required
+def product_add(sid):
+    shop = db().execute("SELECT * FROM shops WHERE id=? AND active=1", (sid,)).fetchone()
+    if not shop or not shop_manager(shop): raise ApiError("Shop not found.", 404)
+    d = body(); name = str(d.get("name", "")).strip()[:60]; price = money(d.get("price"))
+    stock = None if str(d.get("stock", "")).strip() == "" else int(d["stock"])
+    if not name or (stock is not None and stock < 0): raise ApiError("A name and a valid stock number are required.")
+    db().execute("INSERT INTO products(shop_id,name,description,emoji,price,stock) VALUES(?,?,?,?,?,?)", (sid, name, str(d.get("description", ""))[:120], str(d.get("emoji") or "🎁")[:8], price, stock)); return jsonify(ok=True)
+@app.post("/api/products/<int:pid>/remove")
+@login_required
+def product_remove(pid):
+    p = db().execute("SELECT p.id,s.owner_account_id FROM products p JOIN shops s ON s.id=p.shop_id WHERE p.id=?", (pid,)).fetchone()
+    if not p or not shop_manager(p): raise ApiError("Product not found.", 404)
+    db().execute("UPDATE products SET active=0 WHERE id=?", (pid,)); return jsonify(ok=True)
+
+@app.post("/api/shops/<int:sid>/buy")
+@login_required
+def buy(sid):
+    d = body(); u = me(); a = my_account(); key = str(d.get("idem_key", ""))[:80]
+    try: qty = int(d.get("qty") or 1)
+    except ValueError: raise ApiError("Quantity must be a number.")
+    if not 1 <= qty <= 99 or not key: raise ApiError("Quantity must be 1 to 99.")
+    c = db().execute("SELECT * FROM cards WHERE id=? AND account_id=?", (d.get("card_id"), a["id"])).fetchone()
+    if not c or not c["pin_hash"]: raise ApiError("Choose one of your cards that has a PIN set.")
+    if c["status"] != "Active": raise ApiError(f"This card is {c['status'].lower()}.", 403)
+    m, y = (int(x) for x in c["expiry"].split("/"))
+    if (y, m) < (int(now()[:4]), int(now()[5:7])): raise ApiError("This card has expired.", 403)
+    if not check_password_hash(c["pin_hash"], str(d.get("pin", ""))):
+        n = c["pin_fails"] + 1; db().execute("UPDATE cards SET pin_fails=?, status=? WHERE id=?", (n, "Frozen" if n >= 3 else "Active", c["id"]))
+        if n >= 3: notify(u["id"], "Card frozen", f"Card ••{c['last4']} was frozen after 3 wrong PIN attempts. You can unfreeze it on the Cards page.")
+        raise ApiError("Wrong PIN." + (" Card frozen after 3 wrong tries." if n >= 3 else f" {3 - n} tries left."), 403)
+    with txn():
+        old = db().execute("SELECT * FROM transactions WHERE idem_key=?", (f"p:{u['id']}:{key}",)).fetchone()
+        if old: return jsonify(tx=tx_dict(old, a["id"]), duplicate=True)
+        a = my_account(); card = db().execute("SELECT status FROM cards WHERE id=?", (c["id"],)).fetchone()
+        p = db().execute("SELECT * FROM products WHERE id=? AND shop_id=? AND active=1", (d.get("product_id"), sid)).fetchone()
+        shop = db().execute("SELECT * FROM shops WHERE id=? AND active=1", (sid,)).fetchone()
+        if not p or not shop: raise ApiError("That item is no longer for sale.", 404)
+        if card["status"] != "Active" or a["status"] != "Active": raise ApiError("Your card or account is restricted.", 403)
+        if shop["owner_account_id"] == a["id"]: raise ApiError("You can't buy from your own shop.")
+        if not eligible(shop["owner_account_id"]): raise ApiError("This shop can't take payments right now.")
+        total = p["price"] * qty
+        if total > setting("max_transfer"): raise ApiError("Amount exceeds the limit.")
+        if total > balance(a["id"]): raise ApiError("Insufficient balance.")
+        if p["stock"] is not None and db().execute("UPDATE products SET stock=stock-? WHERE id=? AND stock>=?", (qty, p["id"], qty)).rowcount == 0: raise ApiError("Not enough stock.")
+        t, _ = post_tx("purchase", total, a["id"], shop["owner_account_id"], f"{shop['name']}: {qty}x {p['name']}", u["id"], f"p:{u['id']}:{key}")
+        db().execute("INSERT INTO orders(tx_id,product_id,qty,card_id,created_at) VALUES(?,?,?,?,?)", (t["id"], p["id"], qty, c["id"], now()))
+        db().execute("UPDATE cards SET pin_fails=0 WHERE id=?", (c["id"],))
+        notify(u["id"], "Purchase complete", f"{qty}x {p['name']} for {fmt(total)}.", t["ref"]); notify(acct_user(shop["owner_account_id"]), "You made a sale", f"{qty}x {p['name']} — {fmt(total)}.", t["ref"])
+    return jsonify(tx=tx_dict(t, a["id"]))
 
 @app.get("/statement")
 @login_required
@@ -518,31 +628,44 @@ PAGE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AvenaBank — National Bank of Avena</title>
 <style>
-:root{--bg:#0d1a14;--panel:#14261d;--line:#2a4034;--ink:#e9efe9;--mute:#9db1a5;--gold:#c9a24b;--green:#1f5a3f;--bad:#e08a7a}
-@media(prefers-color-scheme:light){:root{--bg:#f3f6f3}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,sans-serif}
+:root{--bg:#0b1a13;--panel:#12261c;--line:#2a4a39;--ink:#eef4ee;--mute:#9db8a8;--gold:#e0b44f;--green:#1f7a4f;--red:#d9453b;--blue:#3b82d6;--bad:#ff8f7e;--good:#7fe0a8}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(1200px 600px at 80% -10%,#17402c 0,transparent 60%),var(--bg);color:var(--ink);font:16px/1.5 system-ui,sans-serif}
 a{color:var(--gold)}:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
-.wm{font:700 1.35rem Georgia,serif;letter-spacing:.04em}.wm b{color:var(--gold)}
-#app{display:flex;min-height:100vh}nav{width:230px;background:#0a130e;border-right:1px solid var(--line);padding:1rem;display:flex;flex-direction:column;gap:.25rem}
-nav a{padding:.55rem .7rem;border-radius:8px;color:var(--ink);text-decoration:none}nav a.on,nav a:hover{background:var(--green)}
-nav h4{margin:1rem 0 .2rem;color:var(--gold);font-size:.75rem;letter-spacing:.12em;text-transform:uppercase}
-main{flex:1;padding:1.5rem;max-width:1000px}.top{display:none}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:1rem;margin-bottom:1rem}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:1rem}.big{font:600 2rem Georgia,serif;color:var(--gold)}
-.mute{color:var(--mute);font-size:.9rem}h2{font-family:Georgia,serif;margin-top:0}
-input,select,textarea,button{font:inherit;color:var(--ink);background:#0b1812;border:1px solid var(--line);border-radius:8px;padding:.55rem .7rem}
+.wm{font:700 1.4rem Georgia,serif;letter-spacing:.03em}.wm b{color:var(--gold)}
+.stripe{height:5px;background:linear-gradient(90deg,var(--red) 0 33%,var(--green) 33% 66%,var(--blue) 66%);border-radius:9px;margin:.6rem 0}
+#app{display:flex;min-height:100vh}nav{width:235px;background:#08130d;border-right:1px solid var(--line);padding:1rem;display:flex;flex-direction:column;gap:.2rem;position:sticky;top:0;height:100vh;overflow:auto}
+nav a{padding:.6rem .8rem;border-radius:12px;color:var(--ink);text-decoration:none;transition:.15s}nav a.on{background:linear-gradient(90deg,var(--green),#176240);box-shadow:0 2px 12px #0006}nav a:hover{transform:translateX(3px);background:#173626}
+nav h4{margin:1rem 0 .2rem;color:var(--gold);font-size:.72rem;letter-spacing:.14em;text-transform:uppercase}
+main{flex:1;padding:1.5rem;max-width:1050px;animation:pop .35s ease}@keyframes pop{from{opacity:0;transform:translateY(10px)}}
+.card{background:linear-gradient(180deg,#153024,var(--panel));border:1px solid var(--line);border-radius:18px;padding:1.1rem;margin-bottom:1rem}
+.hero{border-radius:24px;padding:1.4rem 1.6rem;margin-bottom:1rem;background:linear-gradient(135deg,#1f7a4f,#0e3a26 60%,#0b2a1c);border:1px solid #3f8b66;position:relative;overflow:hidden}
+.hero:after{content:"🦊";position:absolute;right:1rem;top:-.4rem;font-size:7rem;opacity:.13}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:1rem}.big{font:700 2.6rem Georgia,serif;color:var(--gold)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:.8rem;margin-bottom:1rem}
+.tile{display:block;text-decoration:none;color:var(--ink);text-align:center;padding:1rem .5rem;border-radius:18px;background:var(--panel);border:1px solid var(--line);transition:.18s}.tile:hover{transform:translateY(-4px) rotate(-1deg);border-color:var(--gold)}.tile span{display:block;font-size:2rem}
+.mute{color:var(--mute);font-size:.9rem}h2{font-family:Georgia,serif;font-size:1.8rem;margin:.2rem 0 1rem}.gold{color:var(--gold);font-weight:700}
+input,select,textarea,button{font:inherit;color:var(--ink);background:#0a1812;border:1px solid var(--line);border-radius:12px;padding:.6rem .8rem}
 label{display:block;margin:.6rem 0 .2rem;color:var(--mute);font-size:.9rem}input,select,textarea{width:100%}
-button{cursor:pointer;background:var(--green);border-color:var(--green)}button.alt{background:none;border-color:var(--gold);color:var(--gold)}button[disabled]{opacity:.5}
-table{width:100%;border-collapse:collapse}td,th{padding:.5rem;border-bottom:1px solid var(--line);text-align:left;font-size:.92rem}.wrap{overflow-x:auto}
-.in{color:#7fd1a0}.out{color:var(--bad)}.tag{border:1px solid var(--line);border-radius:99px;padding:0 .5rem;font-size:.8rem}
-.vcard{width:340px;max-width:100%;aspect-ratio:1.6;border-radius:16px;padding:1.1rem;background:linear-gradient(135deg,#1f5a3f,#0f2b1f);border:1px solid var(--gold);display:flex;flex-direction:column;justify-content:space-between}
-.vcard.Frozen{filter:grayscale(.8);opacity:.7}.row{display:flex;gap:.6rem;flex-wrap:wrap;align-items:end}.row>*{flex:1;min-width:120px}
-#msg{position:fixed;bottom:1rem;right:1rem;max-width:340px}#msg div{background:var(--panel);border:1px solid var(--gold);border-radius:8px;padding:.6rem .9rem;margin-top:.4rem}#msg .e{border-color:var(--bad)}
-#login{max-width:360px;margin:12vh auto;padding:1rem}
-@media(max-width:760px){#app{flex-direction:column}nav{width:100%;flex-direction:row;flex-wrap:wrap;position:sticky;top:0;z-index:2}nav h4{display:none}}
-@media print{nav,#msg,button{display:none!important}}
+button{cursor:pointer;background:linear-gradient(180deg,#27935f,var(--green));border:0;font-weight:600;transition:.15s}button:hover{transform:translateY(-2px);filter:brightness(1.1)}button.alt{background:none;border:1px solid var(--gold);color:var(--gold)}button[disabled]{opacity:.45;transform:none}
+table{width:100%;border-collapse:collapse}td,th{padding:.55rem;border-bottom:1px solid var(--line);text-align:left;font-size:.92rem}.wrap{overflow-x:auto}
+.in{color:var(--good)}.out{color:var(--bad)}.tag{border:1px solid var(--line);border-radius:99px;padding:0 .55rem;font-size:.8rem}
+.row{display:flex;gap:.6rem;flex-wrap:wrap;align-items:end}.row>*{flex:1;min-width:120px}
+.flip{perspective:1100px;width:360px;max-width:100%;cursor:pointer;margin-bottom:.8rem}.fi{position:relative;transition:transform .7s;transform-style:preserve-3d;aspect-ratio:1.586}.flip.on .fi{transform:rotateY(180deg)}
+.vcard{position:absolute;inset:0;backface-visibility:hidden;border-radius:20px;padding:1.1rem 1.2rem;display:flex;flex-direction:column;justify-content:space-between;box-shadow:0 14px 30px #0009;overflow:hidden}
+.vcard.front{background:linear-gradient(135deg,#25a66c,#116040 45%,#0a3322);border:1px solid #e0b44f88}
+.vcard.front:before{content:"";position:absolute;inset:0;background:linear-gradient(115deg,transparent 30%,#ffffff22 45%,transparent 60%);background-size:250% 100%;animation:sheen 5s infinite}@keyframes sheen{from{background-position:150% 0}to{background-position:-100% 0}}
+.vcard.back{transform:rotateY(180deg);background:linear-gradient(135deg,#0f1f17,#07120d);border:1px solid var(--line);padding:0}.mag{height:18%;background:#000;margin-top:1.1rem}.vcard.back p{padding:.8rem 1.2rem;margin:0;font-size:.8rem;color:var(--mute)}
+.chip{width:46px;height:34px;border-radius:7px;background:linear-gradient(135deg,#f3d98a,#b8892e);box-shadow:inset 0 0 0 1px #0004}.cnum{font:1.15rem ui-monospace,monospace;letter-spacing:.1em;text-shadow:0 1px 2px #0008}
+.Frozen .cnum,.Frozen .chip{filter:grayscale(1)}.vcard.Frozen{filter:saturate(.2) brightness(.8)}.vcard.Inactive,.vcard.Replaced{filter:grayscale(1) brightness(.6)}
+.shopgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:.8rem;margin-top:.8rem}.prod{background:#0c1d15;border:1px solid var(--line);border-radius:16px;padding:.9rem;text-align:center;transition:.18s}.prod:hover{transform:translateY(-5px);border-color:var(--gold)}.pe{font-size:2.8rem}
+dialog{background:var(--panel);color:var(--ink);border:1px solid var(--gold);border-radius:20px;padding:1.3rem;width:min(420px,92vw)}dialog::backdrop{background:#000a}
+#login{max-width:400px;margin:9vh auto;padding:1.4rem;text-align:center}#login .em{font-size:4rem;animation:bob 3s ease-in-out infinite}@keyframes bob{50%{transform:translateY(-8px) rotate(4deg)}}
+#msg{position:fixed;bottom:1rem;right:1rem;max-width:340px;z-index:9}#msg div{background:var(--panel);border:1px solid var(--gold);border-radius:12px;padding:.6rem .9rem;margin-top:.4rem;animation:pop .3s}#msg .e{border-color:var(--bad)}
+#cf{position:fixed;inset:0;pointer-events:none;z-index:8}
+@media(max-width:760px){#app{flex-direction:column}nav{width:100%;height:auto;flex-direction:row;flex-wrap:wrap;z-index:2}nav h4,nav .stripe{display:none}}
+@media print{nav,#msg,button{display:none!important}}@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body>
-<div id="root"></div><div id="msg" role="status" aria-live="polite"></div>
+<canvas id="cf" aria-hidden="true"></canvas><div id="root"></div><div id="msg" role="status" aria-live="polite"></div>
 <script>
 const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let ME=null, KEY=null; const newKey=()=>crypto.randomUUID();
@@ -553,16 +676,21 @@ const act=async(btn,fn)=>{btn.disabled=true;try{await fn()}catch(e){toast(e.mess
 const qs=o=>new URLSearchParams(Object.fromEntries(Object.entries(o).filter(([,v])=>v))).toString();
 const val=id=>$('#'+id).value;
 const can=p=>ME.role==='president'||(ME.role==='official'&&ME.perms.includes(p));
+const fm=c=>'₳'+(c/100).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+function confetti(){const c=$('#cf'),x=c.getContext('2d');c.width=innerWidth;c.height=innerHeight;const col=['#d9453b','#1f7a4f','#3b82d6','#e0b44f','#fff'];
+ const p=Array.from({length:120},()=>({x:innerWidth/2,y:innerHeight/3,vx:(Math.random()-.5)*14,vy:Math.random()*-12-3,r:Math.random()*6+3,c:col[Math.random()*5|0],a:Math.random()*6}));let f=0;
+ (function t(){x.clearRect(0,0,c.width,c.height);p.forEach(q=>{q.x+=q.vx;q.y+=q.vy;q.vy+=.35;q.a+=.2;x.fillStyle=q.c;x.fillRect(q.x,q.y,q.r,q.r*Math.abs(Math.sin(q.a)))});if(++f<110)requestAnimationFrame(t);else x.clearRect(0,0,c.width,c.height)})()}
+function countUp(){document.querySelectorAll('[data-count]').forEach(e=>{const to=+e.dataset.count,t0=performance.now();(function s(t){const k=Math.min(1,(t-t0)/800);e.textContent=fm(to*(1-Math.pow(1-k,3)));if(k<1)requestAnimationFrame(s)})(t0)})}
 const mask=a=>a.slice(0,4)+'••••'+a.slice(-3);
 
 async function boot(){try{ME=await api('/me')}catch{ME=null}
-  if(!ME){$('#root').innerHTML=`<form id="login" class="card"><div class="wm">Avena<b>Bank</b> ₳</div><p class="mute">National Bank of Avena · fictional Aurum economy, not real money</p>
+  if(!ME){$('#root').innerHTML=`<form id="login" class="card"><div class="em">🦊</div><div class="wm">Avena<b>Bank</b> ₳</div><div class="stripe"></div><p class="mute">The National Bank of Avena<br>Viva l'Avena!</p>
    <label for="u">Username</label><input id="u" autocomplete="username" required><label for="p">Password</label><input id="p" type="password" autocomplete="current-password" required>
-   <p><button>Sign in</button></p></form>`;
+   <p><button>Sign in</button></p><p class="mute">Fictional Aurum money for the Avena economy. Not real money.</p></form>`;
    $('#login').onsubmit=e=>{e.preventDefault();act(e.submitter,async()=>{await api('/login',{username:val('u'),password:val('p')});boot()})};return}
-  const L=[['dash','Dashboard'],['send','Send Aurum'],['hist','History'],['cards','Cards'],['notes','Notifications'+(ME.unread?` (${ME.unread})`:'')]];
-  const A=[['console','Console','view_stats'],['accts','Accounts','manage_accounts'],['issue','Issue Aurum','issue'],['income','Income Payments','income'],['atx','Transactions','view_transactions'],['disp','Disputes','disputes'],['acards','Cards','manage_cards'],['audit','Audit Log','view_audit']].filter(x=>can(x[2]));
-  $('#root').innerHTML=`<div id="app"><nav aria-label="Main"><div class="wm">Avena<b>Bank</b> ₳</div>${ME.account?L.map(l=>`<a href="#${l[0]}" data-r="${l[0]}">${l[1]}</a>`).join(''):''}
+  const L=[['dash','🏠 Home'],['shop','🛍️ Marketplace'],['send','💸 Send Aurum'],['cards','💳 My Cards'],['hist','📜 History'],['notes','🔔 Notifications'+(ME.unread?` (${ME.unread})`:'')]];
+  const A=[['console','Console','view_stats'],['accts','Accounts','manage_accounts'],['issue','Issue Aurum','issue'],['income','Income Payments','income'],['atx','Transactions','view_transactions'],['disp','Disputes','disputes'],['acards','Cards','manage_cards'],['audit','Audit Log','view_audit'],['shopsadm','Shops','shops']].filter(x=>can(x[2]));
+  $('#root').innerHTML=`<div id="app"><nav aria-label="Main"><div class="wm">🦊 Avena<b>Bank</b> ₳</div><div class="stripe"></div>${ME.account?L.map(l=>`<a href="#${l[0]}" data-r="${l[0]}">${l[1]}</a>`).join(''):''}
    ${A.length?'<h4>Administration</h4>'+A.map(l=>`<a href="#${l[0]}" data-r="${l[0]}">${l[1]}</a>`).join(''):''}<a href="#" id="out">Sign out</a></nav><main id="main" tabindex="-1"></main></div>`;
   $('#out').onclick=async e=>{e.preventDefault();await api('/logout',{});boot()};route()}
 addEventListener('hashchange',()=>ME&&route());
@@ -570,18 +698,25 @@ async function route(){const r=location.hash.slice(1)||(ME.account?'dash':'conso
   document.querySelectorAll('nav a[data-r]').forEach(a=>a.classList.toggle('on',a.dataset.r===r));
   $('#main').innerHTML='<p class="mute">Loading…</p>';
   try{$('#main').innerHTML=await (V[r]||V.dash)()}catch(e){$('#main').innerHTML=`<div class="card">${esc(e.message)}</div>`}
-  if(W[r])W[r]();}
+  countUp();if(W[r])W[r]();}
 const txTable=(items,adm)=>items.length?`<div class="wrap"><table><tr><th>Date</th><th>Ref</th><th>Type</th><th>Description</th><th>Amount</th><th>Status</th></tr>${items.map(t=>`<tr><td>${esc(t.created_at.replace('T',' ').slice(0,16))}</td><td>${esc(t.ref)}</td><td>${esc(t.type)}</td><td>${esc(t.description)}${adm?` <span class="mute">${esc(t.sender?.public_id||'—')}→${esc(t.recipient?.public_id||'—')}</span>`:''}</td>
  <td class="${t.direction}">${t.direction?(t.direction==='in'?'▲ +':'▼ −'):''}${esc(t.amount_fmt)}</td><td><span class="tag">${esc(t.status)}</span></td></tr>`).join('')}</table></div>`:'<p class="mute">No transactions yet.</p>';
 const V={},W={};
-V.dash=async()=>{const t=await api('/transactions?page=1'),a=ME.account;return`<h2>Welcome, ${esc(ME.name)}</h2><div class="grid"><div class="card"><div class="mute">Available balance</div><div class="big">${esc(a.balance_fmt)}</div><div class="mute">Account ${esc(mask(a.public_id))} · <span class="tag">${esc(a.status)}</span></div></div></div>
- <div class="card"><h3>Recent transactions</h3>${txTable(t.items.slice(0,6))}<p><a href="#send">Send Aurum</a> · <a href="#cards">View cards</a> · <a href="#hist">Full history</a></p></div>`};
+V.dash=async()=>{const t=await api('/transactions?page=1'),a=ME.account,m=new Date().toISOString().slice(0,7);let inn=0,out=0;
+ t.items.forEach(x=>{if(x.created_at.startsWith(m)){x.direction==='in'?inn+=x.amount:out+=x.amount}});
+ let b=a.balance;const pts=[b];t.items.slice(0,12).forEach(x=>{b+=x.direction==='in'?-x.amount:x.amount;pts.push(b)});pts.reverse();
+ const mx=Math.max(...pts),mn=Math.min(...pts),sp=pts.map((v,i)=>`${i*(300/Math.max(1,pts.length-1))},${56-(mx===mn?28:(v-mn)/(mx-mn)*52)}`).join(' ');
+ return`<div class="hero"><div class="mute">Good to see you, ${esc(ME.name)} 🦊</div><div class="mute">Available balance</div><div class="big" data-count="${a.balance}">${fm(a.balance)}</div>
+  <div class="mute">Account ${esc(mask(a.public_id))} · <span class="tag">${esc(a.status)}</span></div><svg viewBox="0 0 300 60" width="100%" height="60" aria-label="Recent balance trend" style="margin-top:.6rem"><polyline points="${sp}" fill="none" stroke="#e0b44f" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/></svg></div>
+ <div class="tiles"><a class="tile" href="#send"><span>💸</span>Send</a><a class="tile" href="#shop"><span>🛍️</span>Shop</a><a class="tile" href="#cards"><span>💳</span>Cards</a><a class="tile" href="#hist"><span>📜</span>History</a></div>
+ <div class="grid"><div class="card"><div class="mute">Received this month</div><div class="big in" style="font-size:1.6rem">+${fm(inn)}</div></div><div class="card"><div class="mute">Spent this month</div><div class="big out" style="font-size:1.6rem">−${fm(out)}</div></div></div>
+ <div class="card"><h3>Recent activity</h3>${txTable(t.items.slice(0,6))}</div>`};
 V.send=()=>`<h2>Send Aurum</h2><div class="card"><div id="s1"><label for="to">Recipient account ID</label><input id="to" placeholder="AVN-XXXXXXXXXX"><label for="am">Amount (₳)</label><input id="am" inputmode="decimal">
  <label for="ds">Description</label><input id="ds" maxlength="140"><p><button id="rev">Review</button></p></div><div id="s2" hidden></div></div>`;
 W.send=()=>{$('#rev').onclick=()=>{if(!val('to')||!(parseFloat(val('am'))>0))return toast('Enter a recipient and a positive amount.',1);
   $('#s1').hidden=1;$('#s2').hidden=0;$('#s2').innerHTML=`<p>Send <b>₳${esc(val('am'))}</b> to <b>${esc(val('to').toUpperCase())}</b>?<br><span class="mute">${esc(val('ds'))}</span></p><button id="go">Confirm and send</button> <button class="alt" id="back">Back</button>`;
   $('#back').onclick=()=>{$('#s1').hidden=0;$('#s2').hidden=1};
-  $('#go').onclick=e=>act(e.target,async()=>{const r=await api('/transfer',{to:val('to'),amount:val('am'),description:val('ds'),idem_key:KEY});toast('Sent. Ref '+r.tx.ref);ME=await api('/me');location.hash='#hist';route()})}};
+  $('#go').onclick=e=>act(e.target,async()=>{const r=await api('/transfer',{to:val('to'),amount:val('am'),description:val('ds'),idem_key:KEY});confetti();toast('Sent! Ref '+r.tx.ref);ME=await api('/me');location.hash='#hist';route()})}};
 V.hist=()=>`<h2>Transaction history</h2><div class="card"><div class="row"><div><label for="fq">Search</label><input id="fq"></div><div><label for="ft">Type</label><select id="ft"><option value="">Any</option><option>transfer</option><option>issue</option><option>income</option><option>deduction</option><option>reversal</option></select></div>
  <div><label for="ff">From</label><input id="ff" type="date"></div><div><label for="fe">To</label><input id="fe" type="date"></div><div><label for="fmn">Min ₳</label><input id="fmn"></div><div><label for="fmx">Max ₳</label><input id="fmx"></div>
  <div><label for="fs">Sort</label><select id="fs"><option value="">Newest</option><option value="date_asc">Oldest</option><option value="amount_desc">Amount ↓</option><option value="amount_asc">Amount ↑</option></select></div></div>
@@ -592,10 +727,35 @@ W.hist=()=>{let page=1;const f=()=>({q:val('fq'),type:val('ft'),from:val('ff'),t
   $('#fgo').onclick=()=>{page=1;load()};$('#nx').onclick=()=>{page++;load()};$('#pv').onclick=()=>{page--;load()};
   $('#stm').onclick=()=>open('/statement?'+qs({from:val('ff'),to:val('fe')}));
   $('#dg').onclick=e=>act(e.target,async()=>{await api('/disputes',{ref:val('dr'),message:val('dm')});toast('Dispute submitted.')});load()};
-V.cards=async()=>{const c=await api('/cards');return`<h2>Virtual cards</h2><p class="mute">Fictional identification cards for Avena internal use only. They are not payment cards.</p>${c.map(x=>`<div class="card"><div class="vcard ${x.status}"><div class="row"><div class="wm">Avena<b>Bank</b></div><div style="text-align:right;font-size:1.5rem;color:var(--gold)">₳</div></div>
- <div style="font-size:1.2rem;letter-spacing:.12em">•••• •••• •••• ${esc(x.last4)}</div><div class="row"><div>${esc(x.holder)}</div><div style="text-align:right">Exp ${esc(x.expiry)}<br><span class="tag">${esc(x.status)}</span></div></div></div>
- ${['Active','Frozen'].includes(x.status)?`<p><button data-c="${x.id}" data-a="${x.status==='Active'?'freeze':'unfreeze'}">${x.status==='Active'?'Freeze':'Unfreeze'} card</button></p>`:''}</div>`).join('')||'<p class="mute">You have no card yet.</p>'}<button id="rq">Request a card</button>`};
-W.cards=()=>{$('#rq').onclick=e=>act(e.target,async()=>{await api('/cards',{});route()});document.querySelectorAll('[data-c]').forEach(b=>b.onclick=()=>act(b,async()=>{await api(`/cards/${b.dataset.c}/${b.dataset.a}`,{});route()}))};
+const fnum=n=>'AVEN '+n.replace(/(\d{4})(?=\d)/g,'$1 '),mnum=n=>'AVEN •••• •••• '+n.slice(-4);
+V.cards=async()=>{const c=await api('/cards');return`<h2>💳 My cards</h2><p class="mute">Tap a card to flip it. Your Avena card works at every shop in the Marketplace. It's made for the fictional Avena economy and can't be used anywhere in the real world.</p>
+ ${c.map(x=>`<div class="card"><div class="flip" tabindex="0" role="button" aria-label="Flip card"><div class="fi"><div class="vcard front ${x.status}"><div class="row" style="align-items:center"><div class="wm" style="font-size:1.1rem">🦊 Avena<b>Bank</b></div><div style="text-align:right;font-size:1.4rem;color:var(--gold)">₳ ))) </div></div>
+  <div class="chip"></div><div class="cnum" data-n="${esc(x.number)}">${esc(mnum(x.number||'0000000000000000'))}</div><div class="row" style="align-items:end"><div>${esc(x.holder).toUpperCase()}</div><div style="text-align:right">VALID THRU ${esc(x.expiry)}<br><span class="tag">${esc(x.status)}</span></div></div></div>
+  <div class="vcard back ${x.status}"><div class="mag"></div><p>Fictional Aurum card of the Avena economy. Not a real payment card. Never share your PIN.</p><p>National Bank of Avena · Viva l'Avena 🦊</p></div></div></div>
+  <div class="row"><button class="alt" data-rv="${x.id}">👁 Show number</button>${['Active','Frozen'].includes(x.status)?`<button data-c="${x.id}" data-a="${x.status==='Active'?'freeze':'unfreeze'}">${x.status==='Active'?'❄️ Freeze':'🔥 Unfreeze'}</button>`:''}<button class="alt" data-pin="${x.id}" data-has="${x.has_pin?1:0}">🔑 ${x.has_pin?'Change':'Set'} PIN</button></div></div>`).join('')||'<p class="mute">You have no card yet.</p>'}
+ <div class="card"><h3>Get a new card</h3><label for="np">Choose a 4-digit PIN</label><input id="np" inputmode="numeric" maxlength="4" autocomplete="off" type="password"><p><button id="rq">Request my card</button></p></div>`};
+W.cards=()=>{$('#rq').onclick=e=>act(e.target,async()=>{await api('/cards',{pin:val('np')});confetti();toast('Your new card is ready! 🎉');route()});
+ document.querySelectorAll('.flip').forEach(f=>{f.onclick=()=>f.classList.toggle('on');f.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();f.classList.toggle('on')}}});
+ document.querySelectorAll('[data-rv]').forEach(b=>b.onclick=()=>{const n=b.closest('.card').querySelector('.cnum');const sh=b.dataset.s==='1';n.textContent=sh?mnum(n.dataset.n):fnum(n.dataset.n);b.dataset.s=sh?'0':'1';b.textContent=sh?'👁 Show number':'🙈 Hide number'});
+ document.querySelectorAll('[data-pin]').forEach(b=>b.onclick=()=>act(b,async()=>{const old=b.dataset.has==='1'?prompt('Current PIN:'):'';if(old===null)return;const p=prompt('New 4-digit PIN:');if(!p)return;await api(`/cards/${b.dataset.pin}/pin`,{old,pin:p});toast('PIN saved.')}));
+ document.querySelectorAll('[data-c]').forEach(b=>b.onclick=()=>act(b,async()=>{await api(`/cards/${b.dataset.c}/${b.dataset.a}`,{});route()}))};
+// ---- marketplace ----
+let SHOPS=[];
+V.shop=async()=>{SHOPS=await api('/shops');return`<h2>🛍️ Avena Marketplace</h2>${SHOPS.map(sh=>`<div class="card"><h3>${esc(sh.emoji)} ${esc(sh.name)}</h3><div class="mute">${esc(sh.description)} · run by ${esc(sh.owner)}</div><div class="stripe"></div>
+ <div class="shopgrid">${sh.products.map(p=>`<div class="prod"><div class="pe">${esc(p.emoji)}</div><b>${esc(p.name)}</b><div class="mute">${esc(p.description)}</div><div class="gold">${esc(p.price_fmt)}</div>${p.stock!==null?`<div class="mute">${p.stock} left</div>`:''}
+  ${sh.mine?`<button class="alt" data-rm="${p.id}">Remove</button>`:`<button data-buy="${sh.id}:${p.id}"${p.stock===0?' disabled':''}>Buy</button>`}</div>`).join('')||'<span class="mute">Nothing on the shelves yet.</span>'}</div>
+ ${sh.mine?`<h4>Add a product</h4><div class="row"><input data-e="${sh.id}" placeholder="🎁" aria-label="Emoji" style="max-width:70px"><input data-n="${sh.id}" placeholder="Name" aria-label="Product name"><input data-d="${sh.id}" placeholder="Description" aria-label="Description"><input data-p="${sh.id}" placeholder="Price ₳" aria-label="Price"><input data-s="${sh.id}" placeholder="Stock (blank = unlimited)" aria-label="Stock"><button data-ap="${sh.id}">Add</button></div>`:''}</div>`).join('')||'<p class="mute">No shops yet. The President can open the first one.</p>'}<dialog id="dlg"></dialog>`};
+W.shop=()=>{const q=a=>document.querySelector(`[data-${a}]`);
+ document.querySelectorAll('[data-rm]').forEach(b=>b.onclick=()=>act(b,async()=>{if(!confirm('Remove this product?'))return;await api(`/products/${b.dataset.rm}/remove`,{});route()}));
+ document.querySelectorAll('[data-ap]').forEach(b=>b.onclick=()=>act(b,async()=>{const i=b.dataset.ap,v=k=>document.querySelector(`[data-${k}="${i}"]`).value;await api(`/shops/${i}/products`,{emoji:v('e'),name:v('n'),description:v('d'),price:v('p'),stock:v('s')});toast('Added!');route()}));
+ document.querySelectorAll('[data-buy]').forEach(b=>b.onclick=async()=>{const [sid,pid]=b.dataset.buy.split(':').map(Number),sh=SHOPS.find(x=>x.id===sid),p=sh.products.find(x=>x.id===pid);let cs=[];try{cs=(await api('/cards')).filter(c=>c.status==='Active'&&c.has_pin)}catch(e){}
+  const d=$('#dlg');d.innerHTML=`<h3>${esc(p.emoji)} ${esc(p.name)}</h3><p class="gold">${esc(p.price_fmt)} each</p>${cs.length?`<label for="bq">Quantity</label><input id="bq" type="number" min="1" max="99" value="1"><label for="bc">Pay with</label><select id="bc">${cs.map(c=>`<option value="${c.id}">Card ••${esc(c.last4)}</option>`).join('')}</select>
+   <label for="bp">Card PIN</label><input id="bp" type="password" inputmode="numeric" maxlength="4" autocomplete="off"><p>Total: <b id="bt" class="gold"></b></p><p><button id="pay">Pay now</button> <button class="alt" id="cx">Cancel</button></p>`:'<p>You need an active card with a PIN first. <a href="#cards">Get a card</a></p><button class="alt" id="cx">Close</button>'}`;
+  d.showModal();$('#cx').onclick=()=>d.close();if(!cs.length)return;const key=newKey(),tot=()=>$('#bt').textContent=fm(p.price*(+val('bq')||0));tot();$('#bq').oninput=tot;
+  $('#pay').onclick=e=>act(e.target,async()=>{await api(`/shops/${sid}/buy`,{product_id:pid,qty:+val('bq'),card_id:+val('bc'),pin:val('bp'),idem_key:key});d.close();confetti();toast('Payment complete! 🎉');ME=await api('/me');route()})})};
+V.shopsadm=async()=>{const s=await api('/shops');return`<h2>Shops</h2><div class="card"><h3>Open a new shop</h3><div class="row"><input id="se" placeholder="🏪" aria-label="Emoji" style="max-width:70px"><input id="sn" placeholder="Shop name" aria-label="Shop name"><input id="sd" placeholder="Description" aria-label="Description"><input id="so" placeholder="Owner account ID (AVN-…)" aria-label="Owner account ID"><button id="sb">Open shop</button></div></div>
+ <div class="card">${s.map(x=>`<div>${esc(x.emoji)} <b>${esc(x.name)}</b> · ${esc(x.owner)} · ${x.products.length} products</div>`).join('')||'<span class="mute">No shops yet.</span>'}</div>`};
+W.shopsadm=()=>$('#sb').onclick=e=>act(e.target,async()=>{await api('/admin/shops',{emoji:val('se'),name:val('sn'),description:val('sd'),owner:val('so')});toast('Shop opened!');route()});
 V.notes=async()=>{const n=await api('/notifications');ME=await api('/me');return`<h2>Notifications</h2>${n.map(x=>`<div class="card"><b>${esc(x.title)}</b><div>${esc(x.body)}</div><div class="mute">${esc(x.created_at)}</div></div>`).join('')||'<p class="mute">Nothing yet.</p>'}`};
 // ---- admin ----
 V.console=async()=>{const s=await api('/admin/stats');return`<h2>Banking console</h2><div class="grid">${[['In circulation',s.circulation],['Active accounts',s.active],['Suspended',s.suspended],['Cards issued',s.cards],['Issued (all time)',s.issued],['Transfer volume',s.transfer_volume],['Pending disputes',s.pending_disputes]].map(x=>`<div class="card"><div class="mute">${x[0]}</div><div class="big">${esc(x[1])}</div></div>`).join('')}</div>
